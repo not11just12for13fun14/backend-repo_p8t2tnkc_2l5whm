@@ -2,7 +2,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Literal, Dict, Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -26,6 +26,7 @@ app.add_middleware(
 # -----------------------------
 from bson import ObjectId
 
+
 def to_str_id(doc: Dict[str, Any]):
     if not doc:
         return doc
@@ -38,6 +39,7 @@ def to_str_id(doc: Dict[str, Any]):
             d[k] = v.isoformat()
     return d
 
+
 # -----------------------------
 # Personas (seed + getter)
 # -----------------------------
@@ -48,6 +50,8 @@ DEFAULT_PERSONAS = [
         "description": "Precisa de segurança e provas sociais antes de avançar",
         "traits": ["precisa de confiança", "valoriza empatia", "evita decisão rápida"],
         "difficulty": "medium",
+        "disc_profile": "S",
+        "triggers": ["provas sociais", "garantia", "tempo para decidir"],
     },
     {
         "key": "obj_preco",
@@ -55,6 +59,8 @@ DEFAULT_PERSONAS = [
         "description": "Sente que está caro e compara muito",
         "traits": ["foca em preço", "pede desconto", "compara alternativas"],
         "difficulty": "hard",
+        "disc_profile": "C",
+        "triggers": ["valor agregado", "comparativos", "ROI"],
     },
     {
         "key": "pronto",
@@ -62,6 +68,8 @@ DEFAULT_PERSONAS = [
         "description": "Já decidiu, só precisa de direcionamento para o próximo passo",
         "traits": ["objetivo", "quer agilidade", "pouca tolerância a enrolação"],
         "difficulty": "easy",
+        "disc_profile": "D",
+        "triggers": ["próximos passos claros", "agilidade"],
     },
 ]
 
@@ -74,57 +82,163 @@ try:
 except Exception:
     pass
 
+
+# -----------------------------
+# Auth (simple header-based stub)
+# -----------------------------
+class AuthUser(BaseModel):
+    email: str
+    role: Literal["seller", "manager", "admin"] = "seller"
+    team: Optional[str] = None
+
+
+def get_current_user(x_user: Optional[str] = Header(None, alias="X-User")) -> AuthUser:
+    # For MVP: accept X-User header with "email|role|team" or just email
+    # In real implementation, replace with JWT auth.
+    if x_user:
+        parts = x_user.split("|")
+        if len(parts) == 3:
+            return AuthUser(email=parts[0], role=parts[1], team=parts[2])
+        return AuthUser(email=x_user)
+    return AuthUser(email="anonymous@example.com")
+
+
 # -----------------------------
 # Schemas
 # -----------------------------
 class StartSessionRequest(BaseModel):
     seller_email: str
     persona_key: str
+    weights: Optional[Dict[str, float]] = None
+
 
 class ChatMessageRequest(BaseModel):
     text: str = Field(..., min_length=1)
 
+
 class FinishSessionRequest(BaseModel):
     pass
 
+
+class ScoreConfigPayload(BaseModel):
+    scope: Literal["global", "team", "user"] = "global"
+    team: Optional[str] = None
+    email: Optional[str] = None
+    weights: Dict[str, float]
+
+
+class RegisterPayload(BaseModel):
+    name: str
+    email: str
+    team: Optional[str] = None
+    role: Literal["seller", "manager", "admin"] = "seller"
+
+
 # -----------------------------
-# Scoring logic (simple heuristic)
+# Scoring logic
 # -----------------------------
 RAPPORT_KEYWORDS = ["bom dia", "boa tarde", "boa noite", "tudo bem", "como vai", "prazer"]
 VALUE_KEYWORDS = [
-    "valor", "benefício", "localização", "valorização", "infraestrutura", "qualidade",
-    "condições", "parcelamento", "financiamento", "investimento",
+    "valor",
+    "benefício",
+    "localização",
+    "valorização",
+    "infraestrutura",
+    "qualidade",
+    "condições",
+    "parcelamento",
+    "financiamento",
+    "investimento",
 ]
 CLOSING_KEYWORDS = [
-    "vamos avançar", "fechamos", "podemos agendar", "posso enviar a proposta",
-    "podemos iniciar", "assinar", "fechar negócio", "aprovar cadastro",
+    "vamos avançar",
+    "fechamos",
+    "podemos agendar",
+    "posso enviar a proposta",
+    "podemos iniciar",
+    "assinar",
+    "fechar negócio",
+    "aprovar cadastro",
 ]
 OBJECTION_KEYWORDS = ["caro", "preço", "muito alto", "desconto", "tá caro", "carinho"]
+DISCOVERY_KEYWORDS = ["por que", "o que é mais importante", "orçamento", "prazo", "decisor", "necessidade"]
 
 
-def eval_message_score(text: str) -> Dict[str, float]:
+def eval_message_subscores(text: str) -> Dict[str, float]:
     t = text.lower()
     rapport = any(k in t for k in RAPPORT_KEYWORDS)
-    handles_objection = any(k in t for k in VALUE_KEYWORDS) and any(k in t for k in OBJECTION_KEYWORDS)
+    discovery = any(k in t for k in DISCOVERY_KEYWORDS)
+    handles_objection = any(k in t for k in VALUE_KEYWORDS) and any(
+        k in t for k in OBJECTION_KEYWORDS
+    )
     closing = any(k in t for k in CLOSING_KEYWORDS)
-
-    score = 50.0
-    if rapport:
-        score += 15
-    if handles_objection:
-        score += 20
-    if closing:
-        score += 15
-    # cap 0..100
-    score = max(0.0, min(100.0, score))
-
     return {
         "rapport": 100.0 if rapport else 0.0,
+        "discovery": 100.0 if discovery else 0.0,
         "objection": 100.0 if handles_objection else 0.0,
         "closing": 100.0 if closing else 0.0,
-        "overall": score,
     }
 
+
+def weighted_overall(sub: Dict[str, float], weights: Dict[str, float]):
+    # normalize weights
+    total_w = sum(weights.values()) or 1.0
+    w = {k: v / total_w for k, v in weights.items()}
+    return sum(sub.get(k, 0.0) * w.get(k, 0.0) for k in w.keys())
+
+
+# -----------------------------
+# LLM integration (OpenAI compatible)
+# -----------------------------
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+try:
+    from openai import OpenAI
+
+    openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+except Exception:
+    openai_client = None
+
+
+def generate_ai_reply(persona: Dict[str, Any], history: List[Dict[str, Any]], seller_text: str) -> str:
+    # If no API key, fallback to heuristic reply
+    if openai_client is None:
+        # simple deterministic fallback
+        turn = len([m for m in history if m.get("role") == "seller"]) + 1
+        return ai_reply(persona.get("key"), seller_text, turn)
+
+    system_prompt = (
+        "Você é um cliente em um roleplay de vendas imobiliárias. Responda de forma realista, breve (1-2 frases),"
+        " seguindo o perfil DISC e gatilhos da persona, levantando objeções quando adequado."
+    )
+    persona_desc = f"Persona: {persona.get('name')} | Perfil DISC: {persona.get('disc_profile')} | Traços: {', '.join(persona.get('traits', []))} | Gatilhos: {', '.join(persona.get('triggers', []))}"
+
+    msgs = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": f"{persona_desc}"},
+    ]
+    # include last 6 exchanges
+    for m in history[-12:]:
+        role = "assistant" if m.get("role") == "ai" else "user"
+        msgs.append({"role": role, "content": m.get("text", "")})
+    msgs.append({"role": "user", "content": seller_text})
+
+    try:
+        resp = openai_client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=msgs,
+            temperature=0.7,
+            max_tokens=120,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception:
+        # fallback safe behavior
+        turn = len([m for m in history if m.get("role") == "seller"]) + 1
+        return ai_reply(persona.get("key"), seller_text, turn)
+
+
+# Backward-compatible heuristic reply
 
 def ai_reply(persona_key: str, last_seller_text: str, turn: int) -> str:
     t = last_seller_text.lower()
@@ -146,6 +260,7 @@ def ai_reply(persona_key: str, last_seller_text: str, turn: int) -> str:
         return "Já gostei. Qual o próximo passo para avançarmos?"
     # default
     return "Poderia explicar melhor?"
+
 
 # -----------------------------
 # Routes
@@ -169,6 +284,22 @@ def get_personas():
     return docs
 
 
+@app.post("/api/register")
+def register(payload: RegisterPayload):
+    if db is None:
+        raise HTTPException(500, "Database not available")
+    doc = {
+        "name": payload.name,
+        "email": payload.email,
+        "team": payload.team,
+        "role": payload.role,
+        "is_active": True,
+        "updated_at": datetime.now(timezone.utc),
+    }
+    db["seller"].update_one({"email": payload.email}, {"$set": doc, "$setOnInsert": {"created_at": datetime.now(timezone.utc)}}, upsert=True)
+    return {"status": "ok"}
+
+
 @app.post("/api/sessions/start")
 def start_session(payload: StartSessionRequest):
     if db is None:
@@ -180,6 +311,10 @@ def start_session(payload: StartSessionRequest):
         keys = [p["key"] for p in DEFAULT_PERSONAS]
         if payload.persona_key not in keys:
             raise HTTPException(400, "Persona not found")
+        # construct persona dict from defaults
+        persona = next(p for p in DEFAULT_PERSONAS if p["key"] == payload.persona_key)
+
+    default_weights = {"rapport": 0.3, "discovery": 0.2, "objection": 0.3, "closing": 0.2}
 
     session_doc = {
         "seller_email": payload.seller_email,
@@ -187,6 +322,8 @@ def start_session(payload: StartSessionRequest):
         "status": "active",
         "current_score": 0.0,
         "total_messages": 0,
+        "scoring_weights": payload.weights or get_weight_config_for_user(payload.seller_email) or default_weights,
+        "premium_unlocked": False,
         "messages": [],
         "created_at": datetime.now(timezone.utc),
         "updated_at": datetime.now(timezone.utc),
@@ -230,13 +367,19 @@ def send_message(session_id: str, payload: ChatMessageRequest):
     messages.append({"role": "seller", "text": payload.text, "ts": datetime.now(timezone.utc).isoformat()})
 
     # scoring update
-    metrics = eval_message_score(payload.text)
+    subs = eval_message_subscores(payload.text)
+    weights = session.get("scoring_weights", {"rapport": 0.3, "discovery": 0.2, "objection": 0.3, "closing": 0.2})
+    overall = weighted_overall(subs, weights)
+
     # rolling score: weighted by number of seller turns
     seller_turns = len([m for m in messages if m["role"] == "seller"])
-    new_overall = (session.get("current_score", 0.0) * (seller_turns - 1) + metrics["overall"]) / max(1, seller_turns)
+    new_overall = (session.get("current_score", 0.0) * (seller_turns - 1) + overall) / max(1, seller_turns)
 
-    # AI reply
-    reply_text = ai_reply(session.get("persona_key"), payload.text, seller_turns)
+    # AI reply via LLM or fallback
+    persona = db["persona"].find_one({"key": session.get("persona_key")}) or next(
+        (p for p in DEFAULT_PERSONAS if p["key"] == session.get("persona_key")), {}
+    )
+    reply_text = generate_ai_reply(persona, messages, payload.text)
     messages.append({"role": "ai", "text": reply_text, "ts": datetime.now(timezone.utc).isoformat()})
 
     db["roleplaysession"].update_one(
@@ -253,7 +396,7 @@ def send_message(session_id: str, payload: ChatMessageRequest):
 
     updated = db["roleplaysession"].find_one({"_id": oid})
     out = to_str_id(updated)
-    out["last_metrics"] = metrics
+    out["last_metrics"] = {**subs, "overall": overall}
     return out
 
 
@@ -278,8 +421,17 @@ def finish_session(session_id: str, _: FinishSessionRequest):
         "seller_email": session["seller_email"],
         "persona_key": session["persona_key"],
         "final_score": session.get("current_score", 0.0),
+        "weights": session.get("scoring_weights", {}),
         "created_at": datetime.now(timezone.utc),
     }
+
+    # Coaching feedback generation (LLM or heuristic)
+    try:
+        feedback = generate_coaching_feedback(session)
+        score_doc["feedback"] = feedback
+    except Exception:
+        pass
+
     db["sessionscore"].insert_one(score_doc)
 
     updated = db["roleplaysession"].find_one({"_id": oid})
@@ -295,7 +447,7 @@ def history(seller_email: str):
 
 
 @app.get("/api/leaderboard")
-def leaderboard(period: Literal["7d", "30d", "all"] = "30d"):
+def leaderboard(period: Literal["7d", "30d", "all"] = "30d", team: Optional[str] = None):
     if db is None:
         raise HTTPException(500, "Database not available")
 
@@ -305,12 +457,20 @@ def leaderboard(period: Literal["7d", "30d", "all"] = "30d"):
     elif period == "30d":
         since = datetime.now(timezone.utc) - timedelta(days=30)
 
-    match_stage = {"$match": {}}
+    match: Dict[str, Any] = {}
     if since:
-        match_stage["$match"]["created_at"] = {"$gte": since}
+        match["created_at"] = {"$gte": since}
+
+    if team:
+        # find sellers in team
+        emails = [s.get("email") for s in db["seller"].find({"team": team}, {"email": 1})]
+        if emails:
+            match["seller_email"] = {"$in": emails}
+        else:
+            return []
 
     pipeline = [
-        match_stage,
+        {"$match": match},
         {
             "$group": {
                 "_id": "$seller_email",
@@ -330,6 +490,121 @@ def leaderboard(period: Literal["7d", "30d", "all"] = "30d"):
     return out
 
 
+# ------------- Dynamic Weights Config ---------------
+@app.post("/api/score-config")
+def set_score_config(payload: ScoreConfigPayload, user: AuthUser = Depends(get_current_user)):
+    if db is None:
+        raise HTTPException(500, "Database not available")
+
+    # simple auth: only manager/admin can set global or team
+    if payload.scope in ("global", "team") and user.role not in ("manager", "admin"):
+        raise HTTPException(403, "Not authorized")
+
+    doc = {
+        "scope": payload.scope,
+        "team": payload.team,
+        "email": payload.email,
+        "weights": payload.weights,
+        "updated_at": datetime.now(timezone.utc),
+    }
+    db["scoreconfig"].update_one(
+        {"scope": payload.scope, "team": payload.team, "email": payload.email},
+        {"$set": doc},
+        upsert=True,
+    )
+    return {"status": "ok"}
+
+
+@app.get("/api/score-config")
+def get_score_config(team: Optional[str] = None, email: Optional[str] = None):
+    if db is None:
+        raise HTTPException(500, "Database not available")
+    # precedence: user > team > global
+    doc = None
+    if email:
+        doc = db["scoreconfig"].find_one({"scope": "user", "email": email})
+    if not doc and team:
+        doc = db["scoreconfig"].find_one({"scope": "team", "team": team})
+    if not doc:
+        doc = db["scoreconfig"].find_one({"scope": "global"})
+    return to_str_id(doc) if doc else {"weights": {"rapport": 0.25, "discovery": 0.25, "objection": 0.3, "closing": 0.2}}
+
+
+def get_weight_config_for_user(email: str) -> Optional[Dict[str, float]]:
+    # try user, then team (requires seller profile), then global
+    seller = db["seller"].find_one({"email": email}) if db is not None else None
+    if db is not None:
+        doc = db["scoreconfig"].find_one({"scope": "user", "email": email})
+        if doc:
+            return doc.get("weights")
+        team = seller.get("team") if seller else None
+        if team:
+            doc = db["scoreconfig"].find_one({"scope": "team", "team": team})
+            if doc:
+                return doc.get("weights")
+        doc = db["scoreconfig"].find_one({"scope": "global"})
+        if doc:
+            return doc.get("weights")
+    return None
+
+
+# ------------- Premium Unlock (Trilhas e Metas) ---------------
+@app.get("/api/premium-status")
+def premium_status(seller_email: str, last_n: int = 5, threshold: float = 80.0):
+    if db is None:
+        raise HTTPException(500, "Database not available")
+    cur = db["sessionscore"].find({"seller_email": seller_email}).sort("created_at", -1).limit(last_n)
+    scores = [d.get("final_score", 0.0) for d in cur]
+    if len(scores) < last_n:
+        return {"eligible": False, "reason": f"Complete {last_n - len(scores)} more sessions", "last_n": last_n}
+    avg = sum(scores) / len(scores)
+    return {"eligible": avg >= threshold, "average": round(avg, 1), "last_n": last_n}
+
+
+# ------------- Coaching Feedback ---------------
+
+def generate_coaching_feedback(session: Dict[str, Any]) -> str:
+    # Use LLM if available, else heuristic summary
+    history = session.get("messages", [])
+    persona_key = session.get("persona_key")
+    persona = db["persona"].find_one({"key": persona_key}) or next(
+        (p for p in DEFAULT_PERSONAS if p["key"] == persona_key), {}
+    )
+    if openai_client is None:
+        # heuristic: very simple tips
+        return (
+            "Feedback: Comece construindo rapport (cumprimento, empatia), faça 1-2 perguntas de descoberta (SPIN/BANT),"
+            " trate objeções conectando valor e finalize com próximo passo claro."
+        )
+
+    system = (
+        "Você é um coach sênior de vendas imobiliárias. Dê feedback direto e acionável em 5 bullets:"
+        " 1) Rapport, 2) Descoberta (SPIN/BANT), 3) Tratativa de Objeções, 4) Fechamento, 5) Próximos exercícios."
+        " Foque em exemplos do diálogo e seja curto (máx 80 palavras)."
+    )
+
+    transcript = "\n".join([f"{m['role']}: {m['text']}" for m in history[-20:]])
+    persona_desc = f"Persona: {persona.get('name')} ({persona.get('disc_profile')}) | Traços: {', '.join(persona.get('traits', []))} | Gatilhos: {', '.join(persona.get('triggers', []))}"
+
+    msgs = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": f"{persona_desc}\n\nDiálogo:\n{transcript}"},
+    ]
+
+    try:
+        resp = openai_client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=msgs,
+            temperature=0.5,
+            max_tokens=220,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception:
+        return (
+            "Feedback: Mantenha rapport, aprofunde necessidades (SPIN/BANT), conecte valor às objeções e feche pedindo o próximo passo."
+        )
+
+
 @app.get("/test")
 def test_database():
     response = {
@@ -339,6 +614,7 @@ def test_database():
         "database_name": None,
         "connection_status": "Not Connected",
         "collections": [],
+        "llm": "❌ Disabled",
     }
 
     try:
@@ -357,6 +633,8 @@ def test_database():
             response["database"] = "⚠️  Available but not initialized"
     except Exception as e:
         response["database"] = f"❌ Error: {str(e)[:50]}"
+
+    response["llm"] = "✅ Enabled" if OPENAI_API_KEY else "❌ Disabled"
 
     return response
 
